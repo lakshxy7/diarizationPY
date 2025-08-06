@@ -10,7 +10,7 @@ import torch
 import torchaudio
 
 # --- Configuration & Constants ---
-VAD_MODEL_PATH = "models/silero_vad.jit"
+VAD_MODEL_PATH = "models/silero_vad.onnx" 
 EMBED_MODEL_PATH = "models/ecapa_tdnn.onnx"
 
 SAMPLE_RATE = 16000
@@ -26,18 +26,21 @@ voice_buffer = collections.deque(maxlen=VOICE_BUFFER_SIZE)
 is_speaking = False
 known_speakers = {}
 speaker_count = 0
-vad_model = None
+vad_session = None
 embed_session = None
+vad_state = None  # State for Silero VAD
 
 # --- Main Functions ---
 
 def load_models():
-    """Loads the VAD model (PyTorch) and Embedding model (ONNX)."""
-    global vad_model, embed_session
-
-    print(f"Loading VAD model (PyTorch JIT) from: {VAD_MODEL_PATH}")
-    vad_model = torch.jit.load(VAD_MODEL_PATH)
-    vad_model.eval()
+    """Loads the VAD model (ONNX) and Embedding model (ONNX)."""
+    global vad_session, embed_session, vad_state
+    
+    print(f"Loading VAD model (ONNX) from: {VAD_MODEL_PATH}")
+    vad_session = ort.InferenceSession(VAD_MODEL_PATH)
+    
+    # Initialize VAD state (zeros for first run)
+    vad_state = np.zeros((2, 1, 128), dtype=np.float32)
 
     print(f"Loading Speaker Embedding model (ONNX) from: {EMBED_MODEL_PATH}")
     embed_session = ort.InferenceSession(EMBED_MODEL_PATH)
@@ -45,16 +48,24 @@ def load_models():
 
 def audio_callback(indata, frames, time, status):
     """This function is called for each new audio chunk from the microphone."""
-    global is_speaking, speaker_count, voice_buffer, known_speakers
-
+    global is_speaking, speaker_count, voice_buffer, known_speakers, vad_state
+    
     if status:
         print(status, file=sys.stderr)
 
     vad_input_numpy = indata.flatten().astype(np.float32)
-    vad_input_tensor = torch.from_numpy(vad_input_numpy)
-
-    speech_prob = vad_model(vad_input_tensor, torch.tensor(SAMPLE_RATE)).item()
-
+    
+    # Run VAD inference using ONNX
+    # Silero VAD expects 'input', 'state', and 'sr'
+    outputs = vad_session.run(None, {
+        'input': vad_input_numpy.reshape(1, -1),
+        'state': vad_state,
+        'sr': np.array(SAMPLE_RATE, dtype=np.int64)
+    })
+    
+    speech_prob = outputs[0][0][0]  # Get speech probability
+    vad_state = outputs[1]  # Update state for next iteration
+    
     is_speech = speech_prob > VAD_CONFIDENCE_THRESHOLD
 
     if is_speech:
@@ -67,39 +78,38 @@ def audio_callback(indata, frames, time, status):
         if is_speaking:
             is_speaking = False
             print(" done.")
-
+            
             if len(voice_buffer) < 30:
                 print("Utterance too short, ignoring.")
                 return
 
             full_utterance = np.concatenate(list(voice_buffer))
-
+            
             # --- Feature Extraction and Speaker ID ---
             utterance_tensor = torch.from_numpy(full_utterance.flatten().astype(np.float32))
 
-            # 1. Extract Mel spectrogram features (the correct input for the speaker model)
+            # --- THIS IS THE CORRECTED SECTION ---
+            # The argument is 'sample_frequency', not 'sample_rate'.
             mel_spectrogram = torchaudio.compliance.kaldi.fbank(
                 waveform=utterance_tensor.unsqueeze(0),
                 sample_frequency=SAMPLE_RATE,
                 num_mel_bins=80,
             )
-
-            # 2. Convert features to a NumPy array and add batch dimension
+            
             features_numpy = mel_spectrogram.numpy()
-            features_numpy = np.expand_dims(features_numpy, axis=0)  # Fix: Add batch dimension
-
+            # Add batch dimension: [T, 80] -> [1, T, 80]
+            features_numpy = features_numpy.reshape(1, -1, 80)
             new_embedding = embed_session.run(None, {'feats': features_numpy})[0]
 
-            # --- 3. Compare with known speakers ---
             found_speaker_id = "Unknown Speaker"
             if len(known_speakers) > 0:
                 similarities = {sid: cosine_similarity(new_embedding, emb)[0][0] for sid, emb in known_speakers.items()}
                 max_sim_id = max(similarities, key=similarities.get)
                 max_sim_value = similarities[max_sim_id]
-
+                
                 if max_sim_value > SIMILARITY_THRESHOLD:
                     found_speaker_id = max_sim_id
-
+            
             if found_speaker_id == "Unknown Speaker":
                 speaker_count += 1
                 found_speaker_id = f"Speaker_{speaker_count}"
@@ -112,7 +122,7 @@ if __name__ == "__main__":
     try:
         load_models()
         print("\nStarting audio stream... Speak into your microphone. Press Ctrl+C to stop.")
-
+        
         with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=BLOCKSIZE, dtype='float32'):
             while True:
                 time.sleep(1)
