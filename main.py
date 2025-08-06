@@ -10,9 +10,9 @@ import torch
 import torchaudio
 
 # --- Configuration & Constants ---
-VAD_MODEL_PATH = "models/silero_vad.jit" 
+VAD_MODEL_PATH = "models/silero_vad.jit"
 EMBED_MODEL_PATH = "models/ecapa_tdnn.onnx"
-333
+
 SAMPLE_RATE = 16000
 BLOCKSIZE = 512
 VOICE_BUFFER_SECONDS = 2
@@ -34,7 +34,7 @@ embed_session = None
 def load_models():
     """Loads the VAD model (PyTorch) and Embedding model (ONNX)."""
     global vad_model, embed_session
-    
+
     print(f"Loading VAD model (PyTorch JIT) from: {VAD_MODEL_PATH}")
     vad_model = torch.jit.load(VAD_MODEL_PATH)
     vad_model.eval()
@@ -46,15 +46,15 @@ def load_models():
 def audio_callback(indata, frames, time, status):
     """This function is called for each new audio chunk from the microphone."""
     global is_speaking, speaker_count, voice_buffer, known_speakers
-    
+
     if status:
         print(status, file=sys.stderr)
 
     vad_input_numpy = indata.flatten().astype(np.float32)
     vad_input_tensor = torch.from_numpy(vad_input_numpy)
-    
+
     speech_prob = vad_model(vad_input_tensor, torch.tensor(SAMPLE_RATE)).item()
-    
+
     is_speech = speech_prob > VAD_CONFIDENCE_THRESHOLD
 
     if is_speech:
@@ -67,36 +67,39 @@ def audio_callback(indata, frames, time, status):
         if is_speaking:
             is_speaking = False
             print(" done.")
-            
+
             if len(voice_buffer) < 30:
                 print("Utterance too short, ignoring.")
                 return
 
             full_utterance = np.concatenate(list(voice_buffer))
-            
+
             # --- Feature Extraction and Speaker ID ---
             utterance_tensor = torch.from_numpy(full_utterance.flatten().astype(np.float32))
 
-            # --- THIS IS THE CORRECTED SECTION ---
-            # The argument is 'sample_frequency', not 'sample_rate'.
+            # 1. Extract Mel spectrogram features (the correct input for the speaker model)
             mel_spectrogram = torchaudio.compliance.kaldi.fbank(
                 waveform=utterance_tensor.unsqueeze(0),
                 sample_frequency=SAMPLE_RATE,
                 num_mel_bins=80,
             )
-            
+
+            # 2. Convert features to a NumPy array and add batch dimension
             features_numpy = mel_spectrogram.numpy()
+            features_numpy = np.expand_dims(features_numpy, axis=0)  # Fix: Add batch dimension
+
             new_embedding = embed_session.run(None, {'feats': features_numpy})[0]
 
+            # --- 3. Compare with known speakers ---
             found_speaker_id = "Unknown Speaker"
             if len(known_speakers) > 0:
                 similarities = {sid: cosine_similarity(new_embedding, emb)[0][0] for sid, emb in known_speakers.items()}
                 max_sim_id = max(similarities, key=similarities.get)
                 max_sim_value = similarities[max_sim_id]
-                
+
                 if max_sim_value > SIMILARITY_THRESHOLD:
                     found_speaker_id = max_sim_id
-            
+
             if found_speaker_id == "Unknown Speaker":
                 speaker_count += 1
                 found_speaker_id = f"Speaker_{speaker_count}"
@@ -109,7 +112,7 @@ if __name__ == "__main__":
     try:
         load_models()
         print("\nStarting audio stream... Speak into your microphone. Press Ctrl+C to stop.")
-        
+
         with sd.InputStream(callback=audio_callback, channels=1, samplerate=SAMPLE_RATE, blocksize=BLOCKSIZE, dtype='float32'):
             while True:
                 time.sleep(1)
