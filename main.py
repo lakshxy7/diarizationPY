@@ -12,7 +12,7 @@ import torchaudio
 # --- Configuration & Constants ---
 VAD_MODEL_PATH = "models/silero_vad.jit" 
 EMBED_MODEL_PATH = "models/ecapa_tdnn.onnx"
-
+333
 SAMPLE_RATE = 16000
 BLOCKSIZE = 512
 VOICE_BUFFER_SECONDS = 2
